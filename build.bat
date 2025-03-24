@@ -1,0 +1,1 @@
+pyinstaller --onefile --windowed --version-file VersionInfo.txt --icon=Icon.ico DollyControl.py
