@@ -27,6 +27,9 @@ VRChat Dolly Controller is a Python-based tool that gives you full control over 
 - **Bookmarking:**  
   Save and load pin locations (stored in the `Bookmarks` folder) to quickly recall your preferred camera setups.
 
+- **Play:**  
+  This will wait 7 seconds make a beep and play the path while playing perform.mp3 from your desktop. Not sure how useful that is to anybody else but here it is. 
+
 - **Experimental File Mode:**  
   File mode allows you to import existing camera paths and adjust their positions or rotation. This mode is still under testing.
 
