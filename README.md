@@ -19,8 +19,8 @@ VRChat Dolly Controller is a Python-based tool that gives you full control over 
 
 - **Intuitive Dolly Path Setup**  
   Dolly paths in VRChat are generated using two camera exports:
-  - Path Origin – defines the path location (for example, the center of a circle)
-  - Path Target – defines the point that cameras will always face during playback  
+  - Set Path – defines the path location (for example, the center of a circle)
+  - Set Target – defines the point that cameras will always face during playback  
   When either is changed, the path is recalculated automatically.
 
 - **Interactive Updates**  
