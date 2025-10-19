@@ -1,6 +1,7 @@
 # VRChat Dolly Controller
 
 VRChat Dolly Controller is a Python-based tool that gives you full control over VRChat’s Dolly Camera Mode. Originally developed for my own filmmaking workflow, this software is available for anyone who finds it useful.
+
 <img width="602" height="705" alt="DollyControl_V2 61_ajJ4uKu5hp" src="https://github.com/user-attachments/assets/fd57ccd8-3ced-4980-aae8-686ae1247cb4" />
 
 ---
@@ -32,10 +33,16 @@ VRChat Dolly Controller is a Python-based tool that gives you full control over 
   Includes a simple playback helper that waits seven seconds, plays a beep, and then starts the path while playing `perform.mp3` from your desktop. This was built for personal use but is included as-is.
 
 - **File Mode**  
-  Import existing dolly path JSON files and adjust their world position or rotation. This mode is experimental.
+  Import existing dolly path JSON files and adjust their world position or rotation.
+
+- **Dolly Zoom**
+  Using the path as an origin and target for the end of the dolly move, this will calculate the right zoom to get that Vertigo style shot. 
 
 - **Avatar OSC Control**  
   Includes a Unity package that adds a local avatar menu for controlling dolly functions. This allows Set Path, Set Target, and axis control directly from an avatar menu. Requires VRCFury to install.
+
+- **Axis controls**
+  You are able to reposition a path and rotate on X,Y,Z.  This is also controllable via avatar menu with included vrcfury asset.
 
 ---
 
@@ -49,9 +56,9 @@ The tool communicates with VRChat using OSC. It reads the camera's position and 
 
 1. Place the script in your working environment.
 2. Ensure OSC is enabled in VRChat (`Settings > OSC > Enabled`).
-3. Run the Python script.
+3. Run the Python script (Or compiled release)
 4. In VRChat, bring out the camera and click "Set Path" to define a path origin.
-5. Optionally click "Set Target" to define a focal point.
+5. Optionally click "Set Target" to define where the cameras are looking. (Use Target needs to be checked for the cameras to look at that point) 
 6. Adjust path settings, regenerate as needed, and use pins to save and restore locations.
 
 ---
