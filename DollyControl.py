@@ -13,8 +13,6 @@ import numpy as np
 from pythonosc.udp_client import SimpleUDPClient
 from pythonosc.dispatcher import Dispatcher
 from pythonosc import osc_server
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 from scipy.spatial.transform import Rotation as R
 import ctypes
 from ctypes import wintypes
@@ -22,15 +20,18 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QLabel, QPushButton, QLineEdit, QSlider, QCheckBox, QFileDialog,
                              QScrollArea, QButtonGroup, QMessageBox)
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont, QGuiApplication
-from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QProgressBar
-from PyQt6.QtCore import QTimer, QUrl
+from PyQt6.QtGui import QFont, QGuiApplication, QIcon, QPixmap
+from PyQt6.QtWidgets import QDialog, QLabel, QProgressBar, QTextEdit
+from PyQt6.QtCore import QTimer, QUrl, QObject, pyqtSignal
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PyQt6.QtGui import QIcon, QPixmap
 import base64
 
+
+# Thread-safety for camera pose updates from OSC
+pose_lock = threading.Lock()
+
 # ----------------------------------------------------
-#  DollyControl V2.10 Changa Husky
+#  DollyControl V2.61 Changa Husky
 #  
 #  There are bugs I'm sure this was made for my own
 #  Filmmaking use but if others find it useful cool.
@@ -98,11 +99,9 @@ client = SimpleUDPClient(OSC_IP, OSC_PORT)
 # Dolly Settings & Globals
 # --------------------------
 MAX_RADIUS = 10.0
-MAX_HEIGHT = 5.0
 
 dolly_settings = {
     "radius": 2.0,
-    "height": 0.0,
     "points": 12,
     "duration": 2.0
 }
@@ -112,14 +111,23 @@ aperture = 15.0
 focal_distance = 2
 dolly_zoom_exaggeration = 2.0   # Range: 1.0 to 5.0
 user_points_limit = 15          # Range: 5 to 50
-dolly_mode = 1  # 1 = Circle, 2 = Line, 3 = Elliptical, 4 = File Mode, 5 = Dolly Zoom Mode
+
+# --- Dolly Mode Constants (single source of truth) ---
+MODE_CIRCLE = 1
+MODE_ARC = 2
+MODE_LINE = 3
+MODE_ELLIPSE = 4
+MODE_FILE = 5
+MODE_DOLLY_ZOOM = 6
+# -----------------------------------------------------
+dolly_mode = MODE_CIRCLE  # 1=Circle, 2=Arc, 3=Line, 4=Ellipse, 5=File, 6=Dolly Zoom
 
 start_position = {"X": 0.0, "Y": 0.0, "Z": 0.0}
 exported_center = None
 current_path_data = None
 dolly_vertical = False
 dolly_pause = False
-PAUSE_DURATION = 60.0
+PAUSE_DURATION_DEFAULT = 60.0
 lookat_x_offset = 0.0
 lookat_y_offset = 0.0
 view_target = None
@@ -146,8 +154,6 @@ zoom_slider = None
 zoom_entry = None
 speed_slider = None
 speed_entry = None
-height_slider = None
-height_entry = None
 aperture_slider = None
 aperture_entry = None
 focal_distance_slider = None
@@ -174,6 +180,88 @@ rotation_step_value = 1.0
 # Global flag to disable export processing during target move.
 target_move_mode = False
 
+# Latest camera pose (world space) from VRChat OSC
+current_camera_pos = {"X": 0.0, "Y": 0.0, "Z": 0.0}
+current_camera_rot = {"X": 0.0, "Y": 0.0, "Z": 0.0}  # Euler, degrees
+last_pose_timestamp = 0.0
+
+# Thread-safe bridge so OSC thread can "click" UI buttons
+class ActionBus(QObject):
+    setTargetFromCam = pyqtSignal()
+    setPathFromCam = pyqtSignal()
+    # NEW: generic nudges (thread-safe to UI)
+    nudgeTranslate   = pyqtSignal(str, int)   # axis: "X"/"Y"/"Z", dir: +1/-1
+    nudgeRotate      = pyqtSignal(str, int)   # axis: "X"/"Y"/"Z", dir: +1/-1
+BUS = ActionBus()
+
+# Rising-edge memory so a held toggle doesn’t spam
+_AVATAR_TOGGLE_PREV = {
+    "SetTargetFromCam": 0.0,
+    "SetPathFromCam": 0.0,
+
+    # NEW: translation nudges
+    "SetDolly_T+X": 0.0, "SetDolly_T+Y": 0.0, "SetDolly_T+Z": 0.0,
+    "SetDolly_T-X": 0.0, "SetDolly_T-Y": 0.0, "SetDolly_T-Z": 0.0,
+
+    # NEW: rotation nudges
+    "SetDolly_R+X": 0.0, "SetDolly_R+Y": 0.0, "SetDolly_R+Z": 0.0,
+    "SetDolly_R-X": 0.0, "SetDolly_R-Y": 0.0, "SetDolly_R-Z": 0.0,    
+}
+
+def _reindex_waypoints(path):
+    for i, wp in enumerate(path):
+        wp["Index"] = i
+
+def add_pause_at_end(path, duration=None):
+    """
+    Insert a single pause waypoint at the end that keeps the camera fixed
+    for `duration` seconds.
+    """
+    if not path:
+        return path
+
+    pause_len = (
+        float(dolly_settings.get("pause_duration", PAUSE_DURATION_DEFAULT))
+        if duration is None else float(duration)
+    )
+
+    base = copy.deepcopy(path[-1])
+
+    # keep same transform & schema; only Duration changes
+    base["Duration"] = round(pause_len, 3)
+
+    # Optional: ensure Speed=0 if your player honors per-WP speed
+    # (If your system ignores Speed for fixed-position hold, you can skip this.)
+    base["Speed"] = float(0.0)
+
+    path.append(base)
+    _reindex_waypoints(path)
+    return path
+
+def add_pause_pair_at_end(path, duration=None):
+    if not path:
+        return path
+
+    pause_len = (
+        float(dolly_settings.get("pause_duration", PAUSE_DURATION_DEFAULT))
+        if duration is None else float(duration)
+    )
+
+    last = copy.deepcopy(path[-1])
+    hold1 = copy.deepcopy(last)
+    hold2 = copy.deepcopy(last)
+
+    hold1["Duration"] = round(pause_len, 3)
+    hold1["Speed"] = float(0.0)
+
+    # hold2 can be zero duration (acts as a resume marker), or same as hold1
+    hold2["Duration"] = float(0.0)
+    hold2["Speed"] = float(0.0)
+
+    path.extend([hold1, hold2])
+    _reindex_waypoints(path)
+    return path
+
 def update_arc_angle_slider(value):
     """
     Update the global arc_angle when the slider value changes.
@@ -195,6 +283,16 @@ def on_arc_angle_entry_return():
         arc_angle = val
         regenerate_path()
     except ValueError:
+        pass
+
+def soft_beep():
+    """
+    Very subtle notification beep for invalid actions
+    """
+    try:
+        import winsound
+        winsound.Beep(600, 90)  # <--- softer than Play tone
+    except Exception:
         pass
 
 def get_desktop_folder():
@@ -297,10 +395,15 @@ AAAAAAAAAIAAAAE=
 # Callback Functions for Parameters
 # --------------------------
 
+def ensure_dolly_zoom_init():
+    global initial_dolly_zoom
+    if initial_dolly_zoom is None:
+        initial_dolly_zoom = dolly_zoom
+
 def set_reverse_path(checked):
     global reverse_path
     reverse_path = checked
-    print("Reverse path set to:", reverse_path)
+    APP_WINDOW.append_status(f"Reverse path set to: {reverse_path}")
     regenerate_path()
 
 def update_points_count_slider(value):
@@ -323,7 +426,7 @@ def on_points_count_entry_return():
 def set_is_local(checked):
     global is_local
     is_local = checked
-    print("Is local set to:", is_local)
+    APP_WINDOW.append_status(f"Is local set to: {is_local}")
     regenerate_path()
 
 def update_dz_exaggeration_slider(value):
@@ -331,7 +434,7 @@ def update_dz_exaggeration_slider(value):
     val = round(float(value) / 100, 2)
     dolly_zoom_exaggeration = val
     dz_exag_entry.setText(str(val))
-    if dolly_mode == 5:
+    if dolly_mode == MODE_DOLLY_ZOOM :
         regenerate_path()
 
 def on_dz_exaggeration_entry_return():
@@ -340,7 +443,7 @@ def on_dz_exaggeration_entry_return():
         val = float(dz_exag_entry.text())
         val = max(1.0, min(5.0, val))
         dolly_zoom_exaggeration = val
-        if dolly_mode == 5:
+        if dolly_mode == MODE_DOLLY_ZOOM :
             regenerate_path()
     except ValueError:
         pass
@@ -391,7 +494,7 @@ def update_zoom_slider(value):
     val = round(float(value), 2)
     dolly_zoom = val
     zoom_entry.setText(str(val))
-    if dolly_mode != 5:
+    if dolly_mode != MODE_DOLLY_ZOOM:
         send_dolly_path()
 
 def update_speed_slider(value):
@@ -400,13 +503,6 @@ def update_speed_slider(value):
     dolly_speed = val
     speed_entry.setText(str(val))
     send_dolly_path()
-
-def update_height_slider(value):
-    global dolly_settings, height_entry
-    val = round(float(value) / 100, 2)
-    dolly_settings["height"] = val
-    height_entry.setText(str(val))
-    regenerate_path()
 
 def on_translation_step_entry_return():
     global translation_step_value
@@ -439,6 +535,12 @@ def update_rotation_step_slider(value):
     val = round(float(value) / 100, 2)
     rotation_step_value = val
     rotation_step_entry.setText(str(val))
+
+def _rising_edge(param_name: str, val: float) -> bool:
+    prev = _AVATAR_TOGGLE_PREV.get(param_name, 0.0)
+    fire = (val >= 0.5) and (prev < 0.5)
+    _AVATAR_TOGGLE_PREV[param_name] = val
+    return fire
 
 def update_lookat_x_slider(value):
     global lookat_x_offset, lookat_x_entry
@@ -477,13 +579,6 @@ def on_duration_entry_return():
     except ValueError:
         pass
 
-def update_radius_slider(value):
-    global dolly_settings, radius_entry
-    val = round(float(value) / 100, 2)
-    dolly_settings["radius"] = val
-    radius_entry.setText(str(val))
-    regenerate_path()
-
 def on_zoom_entry_return():
     global dolly_zoom
     try:
@@ -491,7 +586,7 @@ def on_zoom_entry_return():
         val = max(20.0, min(300.0, val))
         zoom_slider.setValue(int(val))
         dolly_zoom = val
-        if dolly_mode != 5:
+        if dolly_mode != MODE_DOLLY_ZOOM:
             send_dolly_path()
     except ValueError:
         pass
@@ -504,16 +599,6 @@ def on_speed_entry_return():
         speed_slider.setValue(int(val * 100))
         dolly_speed = val
         send_dolly_path()
-    except ValueError:
-        pass
-
-def on_height_entry_return():
-    try:
-        val = float(height_entry.text())
-        val = max(0.0, min(5.0, val))
-        height_slider.setValue(int(val * 100))
-        dolly_settings["height"] = val
-        regenerate_path()
     except ValueError:
         pass
 
@@ -539,61 +624,6 @@ def on_lookat_y_entry_return():
     except ValueError:
         pass
 
-# --------------------------
-# File Monitoring to Extract Exported Data
-# --------------------------
-class ExportFileHandler(FileSystemEventHandler):
-    def on_created(self, event):
-        if event.src_path.endswith(".json"):
-            print(f"New exported path detected: {event.src_path}")
-            time.sleep(1)
-            extract_start_position(event.src_path)
-
-def extract_start_position(file_path):
-    global start_position, exported_center, view_target, use_view_target, initial_dolly_distance, initial_dolly_zoom, dolly_zoom_btn, use_view_target_checkbox, target_move_mode
-    if target_move_mode:
-        print("Target move mode active; ignoring export file.")
-        return
-    if not os.path.exists(file_path):
-        print("Exported file not found. Using default start position (0,0,0).")
-        return
-    try:
-        with open(file_path, "r", encoding="utf-8") as file:
-            data = json.load(file)
-        if data and len(data) > 0 and "Position" in data[0]:
-            start_position = data[0]["Position"]
-            exported_center = copy.deepcopy(start_position)
-            print(f"Using exported center: {exported_center}")
-            if len(data) >= 2 and "Position" in data[1]:
-                view_target = data[1]["Position"]
-                use_view_target = True
-                if use_view_target_checkbox is not None:
-                    use_view_target_checkbox.setChecked(True)
-                center_vec = np.array([exported_center["X"], exported_center["Y"], exported_center["Z"]])
-                target_vec = np.array([view_target["X"], view_target["Y"], view_target["Z"]])
-                initial_dolly_distance = np.linalg.norm(target_vec - center_vec)
-                initial_dolly_zoom = dolly_zoom
-                print(f"Initial dolly distance: {initial_dolly_distance}, initial zoom: {initial_dolly_zoom}")
-                print(f"View target set to: {view_target}")
-            else:
-                view_target = None
-                use_view_target = False
-                if use_view_target_checkbox is not None:
-                    use_view_target_checkbox.setChecked(False)
-                print("No view target available.")
-        else:
-            print("Exported file has no valid waypoints. Using default start (0,0,0).")
-        new_path = os.path.join(USED_LOCATIONS_PATH, os.path.basename(file_path))
-        shutil.move(file_path, new_path)
-        print(f"Moved used export file to: {new_path}")
-    except Exception as e:
-        print(f"Error reading exported file: {e}")
-    if dolly_zoom_btn is not None:
-        if view_target is not None:
-            dolly_zoom_btn.setEnabled(True)
-        else:
-            dolly_zoom_btn.setEnabled(False)
-
 def export_pin(pin_number):
     """Export current start position, view target (if set), camera offset, rotation offset, and various settings as a pin."""
     pin_file = os.path.join(PINS_PATH, f"pin{pin_number}.json")
@@ -602,7 +632,6 @@ def export_pin(pin_number):
          "duration": dolly_settings["duration"],
          "zoom": dolly_zoom,
          "speed": dolly_speed,
-         "height": dolly_settings["height"],
          "aperture": aperture,
          "focal_distance": focal_distance,
          "arc_angle": arc_angle,
@@ -664,33 +693,16 @@ def load_pin(pin_number):
             dolly_settings["duration"] = settings.get("duration", dolly_settings["duration"])
             dolly_zoom = settings.get("zoom", dolly_zoom)
             dolly_speed = settings.get("speed", dolly_speed)
-            dolly_settings["height"] = settings.get("height", dolly_settings["height"])
             aperture = settings.get("aperture", aperture)
             focal_distance = settings.get("focal_distance", focal_distance)
             arc_angle = settings.get("arc_angle", arc_angle)
             user_points_limit = settings.get("num_points", user_points_limit)
             translation_step_value = settings.get("translation_step", translation_step_value)
             rotation_step_value = settings.get("rotation_step", rotation_step_value)
-        print(f"Loaded Pin {pin_number}:\n  Origin: {start_position}\n  Target: {view_target}\n  Camera Offset: {camera_offset}\n  Rotation Offset (Euler): {data.get('rotation_offset')}\n  Settings: {data.get('settings', {})}")
+        APP_WINDOW.append_status(f"Loaded Pin {pin_number}:\n  Origin: {start_position}\n  Target: {view_target}\n  Camera Offset: {camera_offset}\n  Rotation Offset (Euler): {data.get('rotation_offset')}\n  Settings: {data.get('settings', {})}")
         regenerate_path()
     except Exception as e:
         QMessageBox.critical(None, "Pin Load Error", f"Error loading Pin {pin_number}: {e}")
-
-def start_file_monitoring():
-    observer = Observer()
-    event_handler = ExportFileHandler()
-    observer.schedule(event_handler, path=EXPORT_PATH, recursive=False)
-    observer.start()
-    print(f"Monitoring {EXPORT_PATH} for new exported paths...")
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        observer.stop()
-    observer.join()
-
-def start_file_monitoring_thread():
-    threading.Thread(target=start_file_monitoring, daemon=True).start()
 
 # --------------------------
 # Dolly Path Generation Functions
@@ -699,11 +711,13 @@ def generate_circle_path():
     center = exported_center if exported_center is not None else start_position
     dolly_settings["points"] = user_points_limit  
     waypoints = []
+    n_pts = user_points_limit
+    per_wp_duration = float(dolly_settings.get('duration', 2.0)) / max(1, int(user_points_limit) - 1)
     for i in range(user_points_limit):
         angle = (i / user_points_limit) * 2 * math.pi
         x = round(center["X"] + dolly_settings["radius"] * math.cos(angle), 3)
         z = round(center["Z"] + dolly_settings["radius"] * math.sin(angle), 3)
-        y = round(center["Y"] + dolly_settings["height"], 3)
+        y = round(center["Y"], 3)
         yaw = round(math.degrees(math.atan2(center["Z"] - z, center["X"] - x)), 2)
         wp = {
             "Index": i,
@@ -725,66 +739,131 @@ def generate_circle_path():
         waypoints.append(wp)
     return waypoints
 
-def generate_arc_path():
-    center = exported_center if exported_center else start_position
-    # Suppose center was the old "circle center" used for 180° arcs.
-    # R is your original radius
-    R = dolly_settings["radius"]
-    # L is the half-circle length
-    L = R * math.pi
+def generate_arc_path(
+    arc_degrees: float,
+    radius: float,
+    clockwise: bool = False,
+    path_index: int = 0,
+    hue: float = 120.0,
+    saturation: float = 100.0,
+    lightness: float = 50.0,
+    look_at_center: bool = True,   # if False, face tangent along path
+    eps: float = 1e-6,):
+    """
+    Build a path along an arc centered on `view_target` if set, otherwise
+    around the current camera position as a fallback center.
 
-    # Convert the user arc angle from degrees to radians
-    arc_rad = math.radians(arc_angle)
+    Waypoint schema matches other generators:
+      Index, PathIndex, FocalDistance, Aperture, Hue/Saturation/Lightness,
+      LookAtMeXOffset/LookAtMeYOffset, Zoom, Speed, Duration,
+      Position{X,Y,Z}, Rotation{X,Y,Z}, islocal
 
-    # If the user wants the same arc length as the half circle, compute a bigger radius
-    effective_radius = L / arc_rad
+    Rotation rule:
+      - if look_at_center: yaw faces the center of the arc (classic orbit)
+      - else: yaw faces tangent direction (forward along motion)
 
-    # Old midpoint for the 180° arc was at angle=0 in [-π/2..+π/2],
-    # which is center.x + R on the X axis
-    oldMidX = center["X"] + R
-    oldMidZ = center["Z"]
+    Segment count is derived from arc span: ~1 waypoint per 5 degrees,
+    clamped to [2, 180] to avoid under/over-sampling.
+    """
+    import math
 
-    # The new arc’s unshifted midpoint is at (effective_radius, 0)
-    # so we figure out how much we must shift to make that coincide with (oldMidX, oldMidZ)
-    shiftX = oldMidX - effective_radius
-    shiftZ = oldMidZ - 0
+    # ----- Centers & starting angle -----
+    if view_target is not None:
+        cx = float(view_target["X"])
+        cy = float(view_target["Y"])
+        cz = float(view_target["Z"])
+    else:
+        # Fallback to camera as the center if no target set
+        cx = float(current_camera_pos.get("X", 0.0))
+        cy = float(current_camera_pos.get("Y", 0.0))
+        cz = float(current_camera_pos.get("Z", 0.0))
 
-    # We'll sweep from -arc_rad/2 to +arc_rad/2
-    offset = -arc_rad / 2
+    # Compute start angle from center -> camera vector in world XZ plane
+    vx = float(current_camera_pos.get("X", 0.0)) - cx
+    vz = float(current_camera_pos.get("Z", 0.0)) - cz
+    # Avoid NaN/zero vector (spawn at origin etc.)
+    if abs(vx) <= eps and abs(vz) <= eps:
+        # default start facing +Z from center
+        start_deg = 0.0
+    else:
+        start_deg = math.degrees(math.atan2(vx, vz))  # yaw convention: atan2(X, Z)
+
+    # Normalize inputs
+    span = float(arc_degrees)
+    span = max(0.0, min(360.0, span))
+    if span == 0.0:
+        span = 0.001  # avoid div-by-zero; degenerate tiny arc
+
+    # Direction
+    step_sign = -1.0 if clockwise else 1.0
+
+    # Segments: ~every 5 degrees; clamp [2, 180]
+    segs = max(2, min(180, int(round(max(2.0, span / 5.0)))))
+
+    # Total duration from settings
+    total_duration = float(dolly_settings.get("duration", 5.0))
+    per_wp_duration = total_duration / max(1, segs - 1)
+
+    # Precompute fixed fields
+    fd = float(focal_distance)
+    ap = float(aperture)
+    zf = float(dolly_zoom)
+    spd = float(dolly_speed)
+    local_flag = bool(is_local)
 
     waypoints = []
-    for i in range(user_points_limit):
-        t = i/(user_points_limit - 1) if user_points_limit>1 else 0
-        angle = offset + t * arc_rad
+    for i in range(segs):
+        t = i / (segs - 1) if segs > 1 else 0.0
+        ang_deg = start_deg + step_sign * (t * span)
+        ang_rad = math.radians(ang_deg)
 
-        # Unshifted arc coords
-        rawX = effective_radius * math.cos(angle)
-        rawZ = effective_radius * math.sin(angle)
+        # Position on arc in XZ plane, preserve center Y (or raise/lower here if needed)
+        x = cx + radius * math.sin(ang_rad)
+        z = cz + radius * math.cos(ang_rad)
+        y = cy  # keep level with center; adjust if you have a height slider
 
-        # Shift so midpoint is pinned
-        x = rawX + shiftX
-        z = rawZ + shiftZ
-        y = center["Y"] + dolly_settings["height"]
+        # Yaw:
+        if look_at_center:
+            # Face towards center (orbit): bearing from point to center
+            yaw_deg = math.degrees(math.atan2(cx - x, cz - z))
+        else:
+            # Face tangent along path (forward):
+            # derivative of circle param: tangent is 90° ahead in direction of travel
+            yaw_deg = ang_deg + ( -90.0 if clockwise else 90.0 )
 
-        yaw = math.degrees(math.atan2(center["Z"] - z, center["X"] - x))
         wp = {
             "Index": i,
-            "Position": {"X": round(x,3), "Y": round(y,3), "Z": round(z,3)},
-            "Rotation": {"X": 0, "Y": round(yaw,2), "Z": 0},
-            # plus your other fields...
+            "PathIndex": path_index,
+            "FocalDistance": fd,
+            "Aperture": ap,
+            "Hue": hue,
+            "Saturation": saturation,
+            "Lightness": lightness,
+            "LookAtMeXOffset": 0.0,
+            "LookAtMeYOffset": 0.0,
+            "Zoom": zf,
+            "Speed": spd,
+            "Duration": round(per_wp_duration, 3),
+            "Position": {"X": round(x, 3), "Y": round(y, 3), "Z": round(z, 3)},
+            "Rotation": {"X": 0.0, "Y": round(yaw_deg, 2), "Z": 0.0},
+            "islocal": local_flag,
         }
         waypoints.append(wp)
+
     return waypoints
+
 
 def generate_line_path():
     dolly_settings["points"] = user_points_limit
     waypoints = []
+    n_pts = user_points_limit
+    per_wp_duration = float(dolly_settings.get('duration', 2.0)) / max(1, int(user_points_limit) - 1)
     startX = start_position["X"] - dolly_settings["radius"]
     endX = start_position["X"] + dolly_settings["radius"]
     for i in range(user_points_limit):
         t = i / (user_points_limit - 1) if user_points_limit > 1 else 0
         x = round(startX + t * (endX - startX), 3)
-        y = round(start_position["Y"] + dolly_settings["height"], 3)
+        y = round(start_position["Y"], 3)
         z = start_position["Z"]
         wp = {
             "Index": i,
@@ -798,7 +877,7 @@ def generate_line_path():
             "LookAtMeYOffset": 0.0,
             "Zoom": dolly_zoom,
             "Speed": dolly_speed,
-            "Duration": round(t * dolly_settings["duration"], 3),
+            "Duration": round(per_wp_duration, 3),
             "Position": {"X": x, "Y": y, "Z": z},
             "Rotation": {"X": 0, "Y": 0, "Z": 0},
             "islocal": is_local
@@ -809,12 +888,14 @@ def generate_line_path():
 def generate_elliptical_path():
     dolly_settings["points"] = user_points_limit
     waypoints = []
+    n_pts = user_points_limit
+    per_wp_duration = float(dolly_settings.get('duration', 2.0)) / max(1, int(user_points_limit) - 1)
     elliptical_ratio = 0.75
     for i in range(user_points_limit):
         angle = (i / user_points_limit) * 2 * math.pi
         x = round(start_position["X"] + dolly_settings["radius"] * math.cos(angle), 3)
         z = round(start_position["Z"] + (dolly_settings["radius"] * elliptical_ratio) * math.sin(angle), 3)
-        y = round(start_position["Y"] + dolly_settings["height"], 3)
+        y = round(start_position["Y"], 3)
         wp = {
             "Index": i,
             "PathIndex": 0,
@@ -836,7 +917,7 @@ def generate_elliptical_path():
 
 def generate_loaded_path():
     if not loaded_path_data_original:
-        print("No custom path loaded. Returning empty path.")
+        APP_WINDOW.append_status("No custom path loaded. Returning empty path.")
         return []
     # For file/slot modes, ignore the radius scaling and use a fixed scale factor.
     scale_factor = 1
@@ -851,7 +932,7 @@ def generate_loaded_path():
         ry = wp["Position"]["Y"] - cy
         rz = wp["Position"]["Z"] - cz
         new_x = cx + rx * scale_factor
-        new_y = cy + ry * scale_factor + dolly_settings["height"]
+        new_y = cy + ry * scale_factor
         new_z = cz + rz * scale_factor
         wp["Position"] = {"X": round(new_x, 3), "Y": round(new_y, 3), "Z": round(new_z, 3)}
         wp["Zoom"] = dolly_zoom
@@ -863,7 +944,7 @@ def generate_loaded_path():
 
 def generate_dolly_zoom_path():
     if view_target is None:
-        print("No target available for Dolly Zoom mode; returning empty path.")
+        APP_WINDOW.append_status("No target available for Dolly Zoom mode; returning empty path.")
         return []
     start_vec = np.array([start_position["X"], start_position["Y"], start_position["Z"]])
     target_vec = np.array([view_target["X"], view_target["Y"], view_target["Z"]])
@@ -903,37 +984,37 @@ def generate_dolly_zoom_path():
 
 def regenerate_path():
     global current_path_data
-    if dolly_mode == 1:
+    if dolly_mode == MODE_CIRCLE:
         current_path_data = generate_circle_path()
-    elif dolly_mode == 2:
-        current_path_data = generate_arc_path()   # New Arc mode!
-    elif dolly_mode == 3:
+    elif dolly_mode == MODE_ARC:
+        current_path_data = generate_arc_path(arc_degrees=float(arc_angle), radius=float(dolly_settings.get("radius", 2.0)), clockwise=False, path_index=0, look_at_center=True)
+    elif dolly_mode == MODE_LINE:
         current_path_data = generate_line_path()
-    elif dolly_mode == 4:
+    elif dolly_mode == MODE_ELLIPSE:
         current_path_data = generate_elliptical_path()
-    elif dolly_mode == 5:
+    elif dolly_mode == MODE_FILE:
         current_path_data = generate_loaded_path()
-    elif dolly_mode == 6:
+    elif dolly_mode == MODE_DOLLY_ZOOM:
         current_path_data = generate_dolly_zoom_path()
     else:
         current_path_data = []
 
     # If file mode with a view target, apply camera_offset only to certain points
-    if dolly_mode == 4 and view_target is not None:
+    if dolly_mode == MODE_FILE and view_target is not None:
         for i, pt in enumerate(current_path_data):
             if i == 1:  # skip the "target" itself
                 continue
             for axis in ['X', 'Y', 'Z']:
                 pt["Position"][axis] = round(pt["Position"][axis] + camera_offset[axis], 3)
     # Other modes
-    elif dolly_mode not in [5]:
+    elif dolly_mode not in [MODE_DOLLY_ZOOM]:
         for pt in current_path_data:
             for axis in ['X', 'Y', 'Z']:
                 pt["Position"][axis] = round(pt["Position"][axis] + camera_offset[axis], 3)
 
     # Apply rotation offset for non-Dolly-Zoom modes
-    if dolly_mode not in [5]:
-        if dolly_mode == 4 and view_target is not None:
+    if dolly_mode not in [MODE_DOLLY_ZOOM]:
+        if dolly_mode == MODE_FILE and view_target is not None:
             camera_points = []
             for i, pt in enumerate(current_path_data):
                 if i == 1:
@@ -944,7 +1025,7 @@ def regenerate_path():
         if camera_points:
             pivot = np.mean(camera_points, axis=0)
             for i, pt in enumerate(current_path_data):
-                if dolly_mode == 4 and view_target is not None and i == 1:
+                if dolly_mode == MODE_FILE and view_target is not None and i == 1:
                     continue
                 pos = np.array([pt["Position"]["X"], pt["Position"]["Y"], pt["Position"]["Z"]])
                 rel = pos - pivot
@@ -955,7 +1036,7 @@ def regenerate_path():
                 pt["Position"]["Z"] = round(new_pos[2], 3)
         if current_path_data:
             for i, pt in enumerate(current_path_data):
-                if dolly_mode == 4 and view_target is not None and i == 1:
+                if dolly_mode == MODE_FILE and view_target is not None and i == 1:
                     continue
                 base_rot = R.from_euler('XYZ', [pt["Rotation"]["X"], pt["Rotation"]["Y"], pt["Rotation"]["Z"]], degrees=True)
                 new_rot = camera_rotation_offset * base_rot
@@ -966,23 +1047,21 @@ def regenerate_path():
     send_dolly_path()
 
 def send_dolly_path():
-
     global initial_import
     if initial_import:
         print("Initial import suppressed.")
         initial_import = False
         return
-        
     if current_path_data is None:
         return
 
     # Make a copy of the current path data.
-    final_data = current_path_data.copy()
+    final_data = copy.deepcopy(current_path_data)
 
     # Apply reversal if the flag is set.
     if reverse_path:
-        # For file mode (dolly_mode==4) with a target, keep index 1 fixed.
-        if dolly_mode == 4 and view_target is not None and len(final_data) > 2:
+        # For file mode (dolly_mode==MODE_FILE) with a target, keep index 1 fixed.
+        if dolly_mode == MODE_FILE and view_target is not None and len(final_data) > 2:
             # Keep first two points (start and target) intact.
             start_target = final_data[:2]
             # Reverse the remaining points.
@@ -994,13 +1073,13 @@ def send_dolly_path():
         # Optionally update the Index fields for debugging:
         for i, pt in enumerate(final_data):
             pt["Index"] = i
-        print("Reversed path order:", [pt["Index"] for pt in final_data])
+        APP_WINDOW.append_status(f"Reversed path order:", [pt["Index"] for pt in final_data])
 
     # Apply common adjustments.
     for pt in final_data:
         pt["LookAtMeXOffset"] = lookat_x_offset
         pt["LookAtMeYOffset"] = lookat_y_offset
-        if dolly_mode != 5:
+        if dolly_mode != MODE_DOLLY_ZOOM:
             pt["Zoom"] = dolly_zoom
         pt["Speed"] = dolly_speed
 
@@ -1008,7 +1087,7 @@ def send_dolly_path():
     if view_target is not None and use_view_target:
         for i, pt in enumerate(final_data):
             # In file mode, skip the target waypoint (assumed index 1)
-            if dolly_mode == 4 and view_target is not None and i == 1:
+            if dolly_mode == MODE_FILE and view_target is not None and i == 1:
                 continue
             cam = np.array([pt["Position"]["X"], pt["Position"]["Y"], pt["Position"]["Z"]])
             tgt = np.array([view_target["X"], view_target["Y"], view_target["Z"]])
@@ -1026,18 +1105,10 @@ def send_dolly_path():
 
     # Handle "Pause" by duplicating the last waypoint if needed.
     if dolly_pause and final_data:
-        last_pt = copy.deepcopy(final_data[-1])
-        p1 = copy.deepcopy(last_pt)
-        p2 = copy.deepcopy(last_pt)
-        p1["Duration"] = 60.0
-        p2["Duration"] = 60.0
-        for axis in ["X", "Y", "Z"]:
-            p1["Position"][axis] = round(p1["Position"][axis] + 0.001, 4)
-            p2["Position"][axis] = round(p2["Position"][axis] + 0.002, 4)
-        final_data.extend([p1, p2])
+        add_pause_at_end(final_data)  
 
     json_data = json.dumps(final_data)
-    print(f"Sending dolly path (size: {len(json_data)} bytes)")
+    APP_WINDOW.append_status(f"Sending dolly path (size: {len(json_data)} bytes)")
     temp_file_path = os.path.join(USED_LOCATIONS_PATH, "temp_dolly_export.json")
     try:
         with open(temp_file_path, "w", encoding="utf-8") as f:
@@ -1045,7 +1116,7 @@ def send_dolly_path():
         client.send_message("/dolly/Import", temp_file_path)
         print(f"Sent OSC message with file path: {temp_file_path}")
     except Exception as e:
-        print(f"Error writing temp file: {e}")
+        APP_WINDOW.append_status(f"Error writing temp file: {e}")
 
 
 def adjust_position(axis, direction):
@@ -1054,8 +1125,8 @@ def adjust_position(axis, direction):
     camera_offset[axis] += delta
     if current_path_data is None:
         return
-    for pt in current_path_data:
-        if dolly_mode == 4 and view_target is not None and current_path_data.index(pt) == 1:
+    for i, pt in enumerate(current_path_data):
+        if dolly_mode == MODE_FILE and view_target is not None and i == 1:
             continue
         pt["Position"][axis] = round(pt["Position"][axis] + delta, 3)
     send_dolly_path()
@@ -1065,13 +1136,12 @@ def rotate_path(axis, angle_deg):
     delta_angle = angle_deg * rotation_step_value
     delta_rot = R.from_euler(axis, delta_angle, degrees=True)
     camera_rotation_offset = delta_rot * camera_rotation_offset
-    send_dolly_path()
     regenerate_path()
 
 def rebase_loaded_path():
     global loaded_path_data_original
     if not loaded_path_data_original:
-        print("No custom path loaded to rebase.")
+        APP_WINDOW.append_status("No custom path loaded to rebase.")
         return
     offset_x = start_position["X"] - loaded_path_data_original[0]["Position"]["X"]
     offset_y = start_position["Y"] - loaded_path_data_original[0]["Position"]["Y"]
@@ -1080,89 +1150,180 @@ def rebase_loaded_path():
         wp["Position"]["X"] = round(wp["Position"]["X"] + offset_x, 3)
         wp["Position"]["Y"] = round(wp["Position"]["Y"] + offset_y, 3)
         wp["Position"]["Z"] = round(wp["Position"]["Z"] + offset_z, 3)
-    print("Loaded custom path rebased to start position:", start_position)
+    APP_WINDOW.append_status("Loaded custom path rebased to start position:", start_position)
     regenerate_path()
-
-def osc_callback(address, *args):
-    if address in [
-        "/avatar/parameters/DollyRadius_",
-        "/avatar/parameters/DollyHeight_",
-        "/avatar/parameters/DollyMode_",
-        "/avatar/parameters/DollyVertical_",
-        "/avatar/parameters/LookAtMeXOffset_",
-        "/avatar/parameters/LookAtMeYOffset_"
-    ]:
-        print(f"Received OSC message: {address} {args}")
-    if address == "/avatar/parameters/Play_Dolly" and args and args[0] == 1:
-        send_dolly_path()
-    elif address == "/avatar/parameters/DollyMode_" and args:
-        set_mode(int(args[0]))
-    elif address == "/avatar/parameters/DollyHeight_" and args:
-        dolly_settings["height"] = float(args[0]) * MAX_HEIGHT
-        regenerate_path()
-    elif address == "/avatar/parameters/DollyRadius_" and args:
-        dolly_settings["radius"] = float(args[0]) * MAX_RADIUS
-        regenerate_path()
-    elif address == "/avatar/parameters/DollyVertical_" and args:
-        global dolly_vertical
-        dolly_vertical = bool(args[0])
-        print(f"Dolly vertical set to: {dolly_vertical}")
-        regenerate_path()
-    elif address == "/avatar/parameters/LookAtMeXOffset_" and args:
-        global lookat_x_offset
-        lookat_x_offset = float(args[0])
-        regenerate_path()
-    elif address == "/avatar/parameters/LookAtMeYOffset_" and args:
-        global lookat_y_offset
-        lookat_y_offset = float(args[0])
-        regenerate_path()
 
 def start_osc_server():
     dispatcher = Dispatcher()
-    dispatcher.map("/*", osc_callback)
+    dispatcher.map("/usercamera/Pose", on_usercamera_pose)
+    dispatcher.map("/avatar/parameters/SetTargetFromCam", on_avatar_set_target)
+    dispatcher.map("/avatar/parameters/SetPathFromCam", on_avatar_set_path)
+    dispatcher.map("/avatar/parameters/SetDollyMode", on_avatar_set_dolly_mode)
+
+    # --- NEW: Avatar bool parameters for XYZ translate/rotate nudges ---
+    def make_nudge_handler(param_key: str, kind: str, axis: str, direction: int):
+        # kind: 'T' or 'R'
+        def handler(address, *args):
+            try:
+                val = float(args[0]) if args else 0.0
+            except Exception:
+                val = 0.0
+            if _rising_edge(param_key, val):
+                if kind == 'T':
+                    BUS.nudgeTranslate.emit(axis, direction)  # adjust_position(axis, ±1)
+                else:
+                    BUS.nudgeRotate.emit(axis, direction)     # rotate_path(axis, ±1)
+        return handler
+
+    maps = [
+        # Translation: + / -
+        ("/avatar/parameters/SetDolly_T+X", "SetDolly_T+X", 'T', "X", +1),
+        ("/avatar/parameters/SetDolly_T+Y", "SetDolly_T+Y", 'T', "Y", +1),
+        ("/avatar/parameters/SetDolly_T+Z", "SetDolly_T+Z", 'T', "Z", +1),
+        ("/avatar/parameters/SetDolly_T-X", "SetDolly_T-X", 'T', "X", -1),
+        ("/avatar/parameters/SetDolly_T-Y", "SetDolly_T-Y", 'T', "Y", -1),
+        ("/avatar/parameters/SetDolly_T-Z", "SetDolly_T-Z", 'T', "Z", -1),
+
+        # Rotation: + / -
+        ("/avatar/parameters/SetDolly_R+X", "SetDolly_R+X", 'R', "X", +1),
+        ("/avatar/parameters/SetDolly_R+Y", "SetDolly_R+Y", 'R', "Y", +1),
+        ("/avatar/parameters/SetDolly_R+Z", "SetDolly_R+Z", 'R', "Z", +1),
+        ("/avatar/parameters/SetDolly_R-X", "SetDolly_R-X", 'R', "X", -1),
+        ("/avatar/parameters/SetDolly_R-Y", "SetDolly_R-Y", 'R', "Y", -1),
+        ("/avatar/parameters/SetDolly_R-Z", "SetDolly_R-Z", 'R', "Z", -1),
+    ]
+    for addr, key, kind, axis, direc in maps:
+        dispatcher.map(addr, make_nudge_handler(key, kind, axis, direc))
+
     server = osc_server.ThreadingOSCUDPServer((OSC_IP, OSC_PORT_RECEIVE), dispatcher)
     print(f"Starting OSC server on {OSC_IP}:{OSC_PORT_RECEIVE}")
     server.serve_forever()
 
+def on_avatar_set_dolly_mode(address, *args):
+    """Handle OSC int parameter to switch dolly mode.
+    Accepts values matching the MODE_* constants.
+    Equivalent to pressing the corresponding UI button.
+    """
+    try:
+        raw = args[0] if args else 0
+        # VRChat avatar parameters arrive as floats; cast to int safely
+        val = int(float(raw))
+    except Exception:
+        return
+
+    valid_modes = {MODE_CIRCLE, MODE_ARC, MODE_LINE, MODE_ELLIPSE, MODE_FILE, MODE_DOLLY_ZOOM}
+    if val in valid_modes:
+        # Avoid unnecessary regenerations if the mode is already set
+        if val != dolly_mode:
+            try:
+                APP_WINDOW.append_status(f"OSC: SetDollyMode -> {val}")
+            except Exception:
+                pass
+            set_mode(val)  # same path as pressing a UI button
+
+def on_avatar_set_target(address, *args):
+    if not _camera_pose_is_nonzero():
+        soft_beep()
+        APP_WINDOW.append_status("Ignored SetTargetFromCam: camera at origin (0,0,0).")
+        return
+    try:
+        val = float(args[0]) if args else 0.0
+    except Exception:
+        val = 0.0
+    prev = _AVATAR_TOGGLE_PREV["SetTargetFromCam"]
+    if val >= 0.5 and prev < 0.5:   # rising edge
+        BUS.setTargetFromCam.emit()
+    _AVATAR_TOGGLE_PREV["SetTargetFromCam"] = val
+
+def on_avatar_set_path(address, *args):
+    if not _camera_pose_is_nonzero():
+        soft_beep()
+        APP_WINDOW.append_status("Ignored SetPathFromCam: camera at origin (0,0,0).")
+        return    
+    try:
+        val = float(args[0]) if args else 0.0
+    except Exception:
+        val = 0.0
+    prev = _AVATAR_TOGGLE_PREV["SetPathFromCam"]
+    if val >= 0.5 and prev < 0.5:   # rising edge
+        BUS.setPathFromCam.emit()
+    _AVATAR_TOGGLE_PREV["SetPathFromCam"] = val
+
 def start_osc_server_thread():
     threading.Thread(target=start_osc_server, daemon=True).start()
+
+
+def on_usercamera_pose(address, *args):
+    """OSC handler for camera pose: posX, posY, posZ, rotX, rotY, rotZ (degrees)."""
+    try:
+        if len(args) >= 6:
+            x, y, z, rx, ry, rz = [float(a) for a in args[:6]]
+            with pose_lock:
+                current_camera_pos["X"] = round(x, 3)
+                current_camera_pos["Y"] = round(y, 3)
+                current_camera_pos["Z"] = round(z, 3)
+                current_camera_rot["X"] = round(rx, 2)
+                current_camera_rot["Y"] = round(ry, 2)
+                current_camera_rot["Z"] = round(rz, 2)
+                global last_pose_timestamp
+                last_pose_timestamp = time.time()
+    except Exception:
+        # Ignore malformed packets; keep OSC thread resilient.
+        pass
+
 
 def toggle_reverse_dolly_zoom(val):
     global reverse_dolly_zoom
     reverse_dolly_zoom = val
-    print(f"Reverse Dolly Zoom: {reverse_dolly_zoom}")
-    if dolly_mode == 5:
+    APP_WINDOW.append_status(f"Reverse Dolly Zoom: {reverse_dolly_zoom}")
+    if dolly_mode == MODE_DOLLY_ZOOM:
         regenerate_path()
 
 def set_mode(mode):
     global dolly_mode
     dolly_mode = mode
+    if mode == MODE_DOLLY_ZOOM:  # Dolly Zoom mode
+        ensure_dolly_zoom_init()
     regenerate_path()
 
 def toggle_vertical(val):
     global dolly_vertical
     dolly_vertical = val
-    print(f"Vertical Mode: {dolly_vertical}")
+    APP_WINDOW.append_status(f"Vertical Mode: {dolly_vertical}")
     regenerate_path()
 
 def toggle_pause(val):
     global dolly_pause
     dolly_pause = val
-    print(f"Pause: {dolly_pause}")
+    APP_WINDOW.append_status(f"Pause: {dolly_pause}")
     regenerate_path()
 
 def toggle_use_view_target(val):
     global use_view_target
     use_view_target = val
-    print(f"Use Target: {use_view_target}")
+    APP_WINDOW.append_status(f"Use Target: {use_view_target}")
     regenerate_path()
+
+def _camera_pose_is_nonzero() -> bool:
+    """Return True iff current_camera_pos is NOT the world origin (0,0,0).
+    No age/timestamp checks. Defensive against missing/NaN values.
+    """
+    try:
+        x = float(current_camera_pos.get("X", 0.0))
+        y = float(current_camera_pos.get("Y", 0.0))
+        z = float(current_camera_pos.get("Z", 0.0))
+        # Treat NaN as invalid (acts like zero guard)
+        if any(v != v for v in (x, y, z)):
+            return False
+        return not (x == 0.0 and y == 0.0 and z == 0.0)
+    except Exception:
+        return False
 
 def reset_to_defaults():
     global dolly_zoom, dolly_speed, lookat_x_offset, lookat_y_offset
     global camera_offset, camera_rotation_offset, dolly_vertical, dolly_pause
     global translation_step_value, rotation_step_value, dolly_zoom_exaggeration, aperture, focal_distance, user_points_limit
     dolly_settings["radius"] = 2.0
-    dolly_settings["height"] = 0.0
     dolly_settings["duration"] = 2.0
     dolly_zoom = 45.0
     dolly_speed = 3.0
@@ -1191,9 +1352,6 @@ def reset_to_defaults():
     speed_slider.setValue(int(dolly_speed * 100))
     speed_entry.setText(str(dolly_speed))
 
-    height_slider.setValue(int(dolly_settings["height"] * 100))
-    height_entry.setText(str(dolly_settings["height"]))
-
     lookat_x_slider.setValue(0)
     lookat_x_entry.setText("0.0")
 
@@ -1212,8 +1370,8 @@ def reset_to_defaults():
     aperture_slider.setValue(int(aperture * 100))
     aperture_entry.setText(str(aperture))
 
-    focal_distance_slider.setValue(int(aperture * 100))
-    focal_distance_entry.setText(str(aperture))
+    focal_distance_slider.setValue(int(focal_distance * 100))
+    focal_distance_entry.setText(str(focal_distance))
 
     points_count_slider.setValue(user_points_limit)
     points_count_entry.setText(str(user_points_limit))
@@ -1234,7 +1392,7 @@ def reset_to_defaults():
 class DollyControllerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VRChat Dolly Controller V2.10")
+        self.setWindowTitle("VRChat Dolly Controller V2.61")
         self.setGeometry(100, 100, 800, 840)
         scroll = QScrollArea()
         self.central_widget = QWidget()
@@ -1251,11 +1409,22 @@ class DollyControllerWindow(QMainWindow):
         else:
             load_pin(pin_number)
 
-
     def setup_ui(self):
         #
         # --- 1) Mode Selection (5 main modes only) ---
         #
+
+        action_frame = QHBoxLayout()
+        btn_set_path = QPushButton("Set Path")
+        btn_set_path.clicked.connect(self.set_path_from_camera)
+        action_frame.addWidget(btn_set_path)
+
+        btn_set_target = QPushButton("Set Target")
+        btn_set_target.clicked.connect(self.set_target_from_camera)
+        action_frame.addWidget(btn_set_target)
+
+        self.main_layout.addLayout(action_frame)
+
         mode_frame = QHBoxLayout()
         self.mode_group = QButtonGroup(self)
         self.mode_buttons = {}
@@ -1279,32 +1448,13 @@ class DollyControllerWindow(QMainWindow):
         self.main_layout.addLayout(mode_frame)
 
         #
-        # --- 2) Action Buttons ---
-        #
-        action_frame = QHBoxLayout()
-        regen_btn = QPushButton("Regenerate Path")
-        regen_btn.clicked.connect(regenerate_path)
-        reset_btn = QPushButton("Reset to Defaults")
-        reset_btn.clicked.connect(reset_to_defaults)
-        action_frame.addWidget(regen_btn)
-        action_frame.addWidget(reset_btn)
-        self.main_layout.addLayout(action_frame)
-
-        #
         # --- 3) Custom JSON, Move Target, and Rebase ---
         #
+
         load_frame = QHBoxLayout()
         btn_load_custom = QPushButton("Load Custom JSON File")
         btn_load_custom.clicked.connect(self.load_custom_json)
         load_frame.addWidget(btn_load_custom)
-
-        btn_move_target = QPushButton("Move Target")
-        btn_move_target.clicked.connect(self.move_target)
-        load_frame.addWidget(btn_move_target)
-
-        btn_move_path = QPushButton("Move Path")
-        btn_move_path.clicked.connect(self.move_path)
-        load_frame.addWidget(btn_move_path)
 
         btn_rebase = QPushButton("Rebase Custom Path")
         btn_rebase.clicked.connect(rebase_loaded_path)
@@ -1317,7 +1467,15 @@ class DollyControllerWindow(QMainWindow):
         btn_play.clicked.connect(self.play)
         load_frame.addWidget(btn_play)
 
+        regen_btn = QPushButton("Regenerate Path")
+        regen_btn.clicked.connect(regenerate_path)
+        reset_btn = QPushButton("Reset to Defaults")
+        reset_btn.clicked.connect(reset_to_defaults)
+        load_frame.addWidget(regen_btn)
+        load_frame.addWidget(reset_btn)
+
         # --- 4) Pin Buttons (arranged as 2 rows of 4) ---
+
         pin_frame_row1 = QHBoxLayout()
         pin_frame_row2 = QHBoxLayout()
         self.pin_buttons = {}
@@ -1339,6 +1497,7 @@ class DollyControllerWindow(QMainWindow):
         #
         # --- 5) Dolly Parameters (sliders, text entries, etc.) ---
         #
+
         # Radius
         radius_layout = QHBoxLayout()
         radius_layout.addWidget(QLabel("Radius:     "))
@@ -1402,22 +1561,6 @@ class DollyControllerWindow(QMainWindow):
         speed_slider.valueChanged.connect(update_speed_slider)
         speed_layout.addWidget(speed_slider)
         self.main_layout.addLayout(speed_layout)
-
-        # Height
-        height_layout = QHBoxLayout()
-        height_layout.addWidget(QLabel("Height:     "))
-        global height_entry, height_slider
-        height_entry = QLineEdit(str(dolly_settings["height"]))
-        height_entry.setFixedSize(60, 25)
-        height_entry.editingFinished.connect(on_height_entry_return)
-        height_layout.addWidget(height_entry)
-        height_slider = QSlider(Qt.Orientation.Horizontal)
-        height_slider.setMinimum(0)
-        height_slider.setMaximum(500)
-        height_slider.setValue(int(dolly_settings["height"] * 100))
-        height_slider.valueChanged.connect(update_height_slider)
-        height_layout.addWidget(height_slider)
-        self.main_layout.addLayout(height_layout)
 
         # Aperture
         aperture_layout = QHBoxLayout()
@@ -1532,7 +1675,7 @@ class DollyControllerWindow(QMainWindow):
         # Toggle Options
         toggle_layout = QHBoxLayout()
         global vertical_toggle, pause_toggle, use_view_target_checkbox, reverse_zoom_checkbox
-        vertical_toggle = QCheckBox("Vertical Mode")
+        vertical_toggle = QCheckBox("Rotate 90")
         vertical_toggle.toggled.connect(toggle_vertical)
         toggle_layout.addWidget(vertical_toggle)
         pause_toggle = QCheckBox("Pause")
@@ -1551,11 +1694,6 @@ class DollyControllerWindow(QMainWindow):
         reverse_zoom_checkbox = QCheckBox("Reverse Dolly Zoom")
         reverse_zoom_checkbox.toggled.connect(toggle_reverse_dolly_zoom)
         toggle_layout.addWidget(reverse_zoom_checkbox)
-
-        # Add the new "Is local" checkbox.
-        #  islocal_checkbox = QCheckBox("Is local")
-        #  islocal_checkbox.toggled.connect(lambda checked: set_is_local(checked))
-        #  toggle_layout.addWidget(islocal_checkbox)
 
         self.main_layout.addLayout(toggle_layout)
 
@@ -1612,10 +1750,22 @@ class DollyControllerWindow(QMainWindow):
             ax_layout.addWidget(btn_rot_minus)
             self.main_layout.addLayout(ax_layout)
 
+        # --- Status Panel ---
+        self.status_box = QTextEdit()
+        self.status_box.setReadOnly(True)
+        self.status_box.setFixedHeight(80)
+        self.status_box.setPlaceholderText("Status: Listening for OSC commands")
+        self.main_layout.addWidget(self.status_box)
+
     def set_mode(self, mode):
-        global dolly_mode
-        dolly_mode = mode
-        regenerate_path()
+        set_mode(mode)  # call global helper to handle init & regen
+
+    def append_status(self, msg):
+        ts = time.strftime("%H:%M:%S")
+        try:
+            self.status_box.append(f"[{ts}] {msg}")
+        except Exception:
+            APP_WINDOW.append_status(f"[{ts}] {msg}")
 
     def load_custom_json(self):
         global loaded_path_data_original
@@ -1627,11 +1777,49 @@ class DollyControllerWindow(QMainWindow):
                 data = json.load(f)
             loaded_path_data_original = data
             self.loaded_file_label.setText(f"Loaded file: {os.path.basename(fname)}")
-            print(f"Custom JSON loaded from {fname}, {len(data)} waypoints.")
+            APP_WINDOW.append_status(f"Custom JSON loaded from {fname}, {len(data)} waypoints.")
             regenerate_path()
         except Exception as e:
             self.loaded_file_label.setText("Failed to load file!")
-            print(f"Error loading custom JSON: {e}")
+            APP_WINDOW.append_status(f"Error loading custom JSON: {e}")
+
+    def set_target_from_camera(self):
+        # Use the latest cached camera position as the view target
+        global view_target, use_view_target
+        view_target = {
+            "X": current_camera_pos["X"],
+            "Y": current_camera_pos["Y"],
+            "Z": current_camera_pos["Z"],
+        }
+        use_view_target = True
+
+        if not _camera_pose_is_nonzero():
+            soft_beep()
+            APP_WINDOW.append_status("Ignored SetTargetFromCam: camera at origin (0,0,0).")
+            return
+
+        APP_WINDOW.append_status(f"Pose rx: pos={current_camera_pos} rot={current_camera_rot}")
+
+        # if you have a checkbox bound: use_view_target_checkbox.setChecked(True)
+
+        APP_WINDOW.append_status(f"Target set from camera: {view_target}")
+        regenerate_path()
+
+    def set_path_from_camera(self):
+        # Use the latest cached camera position as the path origin/center
+        global start_position, exported_center
+        start_position["X"] = current_camera_pos["X"]
+        start_position["Y"] = current_camera_pos["Y"]
+        start_position["Z"] = current_camera_pos["Z"]
+        exported_center = dict(start_position)  # if your circle/arc uses this center
+
+        if not _camera_pose_is_nonzero():
+            soft_beep()
+            APP_WINDOW.append_status("Ignored SetTargetFromCam: camera at origin (0,0,0).")
+            return
+
+        APP_WINDOW.append_status(f"Path origin set from camera: {start_position}")
+        regenerate_path()
 
     def play(self):
         # --- Countdown Dialog ---
@@ -1658,10 +1846,10 @@ class DollyControllerWindow(QMainWindow):
                     import winsound
                     winsound.Beep(1000, 1000)  # 1000Hz for 1000ms.
                 except Exception as e:
-                    print("Error playing beep:", e)
+                    APP_WINDOW.append_status("Error playing beep:", e)
                 # Send OSC /dolly/Play command.
                 client.send_message("/dolly/Play", 1)
-                print("Sent OSC /dolly/Play command")
+                APP_WINDOW.append_status("Sent OSC /dolly/Play command")
                 countdown_dialog.accept()
 
         timer.timeout.connect(update_countdown)
@@ -1670,7 +1858,7 @@ class DollyControllerWindow(QMainWindow):
         
         # --- Check if MP3 file exists, skip playback if missing ---
         if not os.path.exists(PERFORM_MP3_PATH):
-            print(f"MP3 file not found at {PERFORM_MP3_PATH}. Skipping playback.")
+            APP_WINDOW.append_status(f"MP3 file not found at {PERFORM_MP3_PATH}. Skipping playback.")
             return  # Exit early, skipping the performance dialog.
 
         # --- Performance Dialog ---
@@ -1700,7 +1888,7 @@ class DollyControllerWindow(QMainWindow):
         def handle_error():
             err = player.error()
             if err:
-                print("Media player error:", player.errorString())
+                APP_WINDOW.append_status("Media player error:", player.errorString())
         player.errorOccurred.connect(lambda e: handle_error())
 
         # Update progress bar and time label.
@@ -1723,147 +1911,7 @@ class DollyControllerWindow(QMainWindow):
         player.play()
         performance_dialog.exec()
 
-
-
-    # New method: Move Target
-    def move_target(self):
-        global target_move_mode, view_target, use_view_target
-        # Disable export processing during target move.
-        target_move_mode = True
-
-        # Build a single-point JSON using the current target.
-        # If no target exists, default to start_position.
-        current_target = view_target if view_target is not None else start_position
-        target_point = {
-            "Index": 0,
-            "PathIndex": 0,
-            "FocalDistance": focal_distance,
-            "Aperture": aperture,
-            "Hue": 120.0,
-            "Saturation": 100.0,
-            "Lightness": 50.0,
-            "LookAtMeXOffset": 0.0,
-            "LookAtMeYOffset": 0.0,
-            "Zoom": dolly_zoom,
-            "Speed": dolly_speed,
-            "Duration": 0,
-            "Position": current_target,
-            "Rotation": {"X": 0, "Y": 0, "Z": 0}
-        }
-        target_data = [target_point]
-        target_file = os.path.join(USED_LOCATIONS_PATH, "temp_target.json")
-        try:
-            with open(target_file, "w", encoding="utf-8") as f:
-                json.dump(target_data, f)
-            # Send the OSC message so VRChat imports just the target point.
-            client.send_message("/dolly/Import", target_file)
-            print(f"Sent target point to VRChat from {target_file}")
-        except Exception as e:
-            print(f"Error writing target file: {e}")
-
         # Show the modal popup instructing the user.
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle("Move the Target")
-        msg_box.setText("Adjust the target in VRChat, then click OK.\n(Don't hit export in game)")
-        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
-        msg_box.setModal(True)
-        msg_box.exec()  # Blocks until OK is pressed.
-
-        # Request VRChat to export the updated target point into our target file.
-        client.send_message("/dolly/Export", target_file)
-        print(f"Requested VRChat to export target into {target_file}")
-        time.sleep(0.5)  # Wait briefly to allow the export to complete.
-
-        # Re-read the updated target file.
-        try:
-            with open(target_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if data and len(data) > 0:
-                new_target = data[0]["Position"]  # Only use the first point.
-                if view_target is None or new_target != view_target:
-                    view_target = new_target
-                    use_view_target = True
-                    print(f"New target updated: {view_target}")
-                    regenerate_path()
-                else:
-                    print("Target position unchanged.")
-            else:
-                print("No valid target data found after move.")
-        except Exception as e:
-            print(f"Error reading updated target file: {e}")
-
-        # Resume normal export processing.
-        target_move_mode = False
-
-    def move_path(self):
-        global target_move_mode, start_position, exported_center
-        # Disable export processing during path move.
-        target_move_mode = True
-
-        # Build a single-point JSON using the current start position.
-        current_start = start_position if start_position is not None else {"X": 0.0, "Y": 0.0, "Z": 0.0}
-        path_point = {
-            "Index": 0,
-            "PathIndex": 0,
-            "FocalDistance": focal_distance,
-            "Aperture": aperture,
-            "Hue": 120.0,
-            "Saturation": 100.0,
-            "Lightness": 50.0,
-            "LookAtMeXOffset": 0.0,
-            "LookAtMeYOffset": 0.0,
-            "Zoom": dolly_zoom,
-            "Speed": dolly_speed,
-            "Duration": 0,
-            "Position": current_start,
-            "Rotation": {"X": 0, "Y": 0, "Z": 0}
-        }
-        path_data = [path_point]
-        path_file = os.path.join(USED_LOCATIONS_PATH, "temp_path.json")
-        try:
-            with open(path_file, "w", encoding="utf-8") as f:
-                json.dump(path_data, f)
-            # Send the OSC command so VRChat imports just the start point.
-            client.send_message("/dolly/Import", path_file)
-            print(f"Sent start path point to VRChat from {path_file}")
-        except Exception as e:
-            print(f"Error writing path file: {e}")
-
-        # Show a modal popup instructing the user.
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle("Move Path")
-        msg_box.setText("Move the Start Position. Adjust the path start in VRChat, then click OK.")
-        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
-        msg_box.setModal(True)
-        msg_box.exec()  # Blocks until OK is pressed.
-
-        # Request VRChat to export the updated start point.
-        client.send_message("/dolly/Export", path_file)
-        print(f"Requested VRChat to export start path into {path_file}")
-        time.sleep(0.5)  # Wait briefly for the export to complete.
-
-        # Re-read the updated file to update start_position and exported_center.
-        try:
-            with open(path_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if data and len(data) > 0:
-                new_start = data[0]["Position"]  # Use the first point.
-                if start_position is None or new_start != start_position:
-                    start_position = new_start
-                    exported_center = copy.deepcopy(new_start)  # Update the center.
-                    print(f"New start position updated: {start_position}")
-                    regenerate_path()
-                else:
-                    print("Start position unchanged.")
-            else:
-                print("No valid start position data found after move.")
-        except Exception as e:
-            print(f"Error reading updated start path file: {e}")
-
-        # Resume normal export processing.
-        target_move_mode = False
-
-
 
 def setup_ui_and_run():
     app = QApplication(sys.argv)
@@ -1929,7 +1977,13 @@ def setup_ui_and_run():
     pixmap = QPixmap()
     pixmap.loadFromData(base64.b64decode(ICON_BASE64), "ICO")
     app.setWindowIcon(QIcon(pixmap))
-    window = DollyControllerWindow()
+    global APP_WINDOW
+    APP_WINDOW = DollyControllerWindow()
+    window = APP_WINDOW
+    BUS.setTargetFromCam.connect(window.set_target_from_camera)
+    BUS.setPathFromCam.connect(window.set_path_from_camera)  
+    BUS.nudgeTranslate.connect(lambda axis, d: adjust_position(axis, d))
+    BUS.nudgeRotate.connect(   lambda axis, d: rotate_path(axis, d))      
     window.show()
     sys.exit(app.exec())
 
@@ -1937,7 +1991,6 @@ def setup_ui_and_run():
 # Main Entry Point
 # --------------------------
 if __name__ == "__main__":
-    start_file_monitoring_thread()
     start_osc_server_thread()
     regenerate_path()
     setup_ui_and_run()

@@ -1,0 +1,4 @@
+numpy>=1.24,<2
+python-osc>=1.8,<2
+scipy>=1.10,<2
+PyQt6>=6.5,<7
