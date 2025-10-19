@@ -1,56 +1,65 @@
 # VRChat Dolly Controller
 
-VRChat Dolly Controller is a Python-based tool that gives you full control over VRChat’s Dolly mode. Originally developed for my own filmmaking, this software is available for anyone who finds it useful.
+VRChat Dolly Controller is a Python-based tool that gives you full control over VRChat’s Dolly Camera Mode. Originally developed for my own filmmaking workflow, this software is available for anyone who finds it useful.
+<img width="602" height="705" alt="DollyControl_V2 61_ajJ4uKu5hp" src="https://github.com/user-attachments/assets/fd57ccd8-3ced-4980-aae8-686ae1247cb4" />
 
-![Dolly Controller Screenshot](https://github.com/user-attachments/assets/de04c92d-818e-44f1-95cd-893a7784713f)
+---
 
 ## Features
 
-- **Real-Time Camera Path Generation:**  
-  Generate dynamic camera paths (e.g., circle, arc, line, elliptical, file, and dolly zoom modes) and modify them on the fly.
+- **Real-Time Camera Path Generation**  
+  Generate camera paths and modify them on the fly using:
+  - Circle Mode
+  - Arc Mode
+  - Line Mode
+  - Elliptical Mode
+  - Dolly Zoom Mode
+  - File Mode
 
-- **Automatic Folder Monitoring:**  
-  The software monitors the `VRChat\CameraPaths` folder for new exports. It automatically moves new exports into two organized folders: `Used_Locations` and `Bookmarks`. This prevents clutter while preserving your exported data.
+- **Intuitive Dolly Path Setup**  
+  Dolly paths in VRChat are generated using two camera exports:
+  - Path Origin – defines the path location (for example, the center of a circle)
+  - Path Target – defines the point that cameras will always face during playback  
+  When either is changed, the path is recalculated automatically.
 
-- **Intuitive Dolly Path Setup:**  
-  Create a Dolly Path in VRChat by exporting two points:  
-  - **First Point:** Defines the path location (for example, the center of a circle in Circle Mode).  
-  - **Second Point:** Defines the target, which is where all cameras will continuously look.  
-  When you move or update the path, the cameras will recalculate to keep their focus on this target.
+- **Interactive Updates**  
+  Use Move Target and Move Path to reposition paths inside VRChat. When either is enabled, the path is temporarily hidden and replaced by a marker. Confirming the movement regenerates the full path in the new position.
 
-- **Interactive Updates:**  
-  Use the **Move Target** and **Move Path** functions to update the respective positions. When activated, the current path temporarily disappears and is replaced with a single point. After you reposition it in-game and confirm the update, the path is recalculated.
+- **Bookmarking System**  
+  Save and reload path origins and targets using Pins. Bookmarks are stored in the `Bookmarks` folder and can be reused at any time.
 
-- **Non-Destructive Importing:**  
-  All manual exports are imported without being deleted. They are automatically moved to the `Used_Locations` folder to avoid clutter and accidental loss of data.
+- **Play Function**  
+  Includes a simple playback helper that waits seven seconds, plays a beep, and then starts the path while playing `perform.mp3` from your desktop. This was built for personal use but is included as-is.
 
-- **Bookmarking:**  
-  Save and load pin locations (stored in the `Bookmarks` folder) to quickly recall your preferred camera setups.
+- **File Mode**  
+  Import existing dolly path JSON files and adjust their world position or rotation. This mode is experimental.
 
-- **Play:**  
-  This will wait 7 seconds make a beep and play the path while playing perform.mp3 from your desktop. Not sure how useful that is to anybody else but here it is. 
+- **Avatar OSC Control**  
+  Includes a Unity package that adds a local avatar menu for controlling dolly functions. This allows Set Path, Set Target, and axis control directly from an avatar menu. Requires VRCFury to install.
 
-- **Experimental File Mode:**  
-  File mode allows you to import existing camera paths and adjust their positions or rotation. This mode is still under testing.
+---
 
 ## How It Works
 
-When running, the script continuously monitors the export folder. In VRChat, you create a Dolly Path by exporting two camera points:
-- The **first point** serves as the reference (for example, the center of the circle in Circle Mode).
-- The **second point** sets the target that all cameras will look at.
+The tool communicates with VRChat using OSC. It reads the camera's position and orientation to generate dolly paths dynamically. Paths are injected directly into the VRChat dolly folder. Control is available through the desktop interface or through the included avatar OSC menu.
 
-When you use the **Move Target** or **Move Path** buttons, the path temporarily resets. You then reposition the point in-game, confirm the update, and the software recalculates the path accordingly.
-
-The tool also preserves any pre-existing paths in memory—unless you actively switch modes, in which case the paths might be updated.
+---
 
 ## Getting Started
 
 1. Place the script in your working environment.
-2. Run the Python script.
-3. In VRChat, export a Dolly Path using two points (start and target).
-4. Watch as the tool automatically updates and recalculates the camera paths in real time.
-5. Use the provided UI to adjust parameters, move targets, rebase paths, and save/load your favorite configurations via pins.
+2. Ensure OSC is enabled in VRChat (`Settings > OSC > Enabled`).
+3. Run the Python script.
+4. In VRChat, bring out the camera and click "Set Path" to define a path origin.
+5. Optionally click "Set Target" to define a focal point.
+6. Adjust path settings, regenerate as needed, and use pins to save and restore locations.
 
 ---
 
-A build script batch file has been included that cam build the EXE with proper windows icon.
+## Building a Windows Executable (Optional)
+
+A batch script is included to build a standalone Windows `.exe` using PyInstaller. This includes a proper Windows icon and avoids requiring Python to be installed to run the tool.
+
+---
+
+
